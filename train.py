@@ -390,7 +390,7 @@ def main(args):
         )
         unet = get_peft_model(unet, config)
         unet.print_trainable_parameters()
-        print(unet)
+        # print(unet)
 
     vae.requires_grad_(False)
     if not args.train_text_encoder:
@@ -405,7 +405,7 @@ def main(args):
         )
         text_encoder = get_peft_model(text_encoder, config)
         text_encoder.print_trainable_parameters()
-        print(text_encoder)
+        # print(text_encoder)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():

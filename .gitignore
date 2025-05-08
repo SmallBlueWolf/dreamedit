@@ -1,5 +1,8 @@
 /AlphaEdit
+/__pycache__
 **/__pycache__/**
 /dataset
 /class_img
 /results
+/eval_results
+/eval_weights

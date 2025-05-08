@@ -1,0 +1,9 @@
+class_data_dir: class_img/cartoon
+class_prompt: a photo of cartoon
+instance_data_dir: dataset/red_cartoon
+instance_prompt: a photo of sks cartoon
+learning_rate: 0.0001
+max_train_steps: 800
+output_dir: eval_weights/red_cartoon
+pretrained_model_name_or_path: CompVis/stable-diffusion-v1-4
+train_batch_size: 1

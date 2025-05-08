@@ -1,0 +1,9 @@
+class_data_dir: class_img/stuffed animal
+class_prompt: a photo of stuffed animal
+instance_data_dir: dataset/wolf_plushie
+instance_prompt: a photo of sks stuffed animal
+learning_rate: 0.0001
+max_train_steps: 800
+output_dir: eval_weights/wolf_plushie
+pretrained_model_name_or_path: CompVis/stable-diffusion-v1-4
+train_batch_size: 1

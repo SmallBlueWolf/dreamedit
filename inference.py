@@ -31,6 +31,10 @@ def get_lora_sd_pipeline(
         pipe.text_encoder.half()
 
     pipe.to(device)
+    
+    # 禁用StableDiffusionPipeline的进度条
+    pipe.set_progress_bar_config(disable=True)
+    
     return pipe
 
 def main():
