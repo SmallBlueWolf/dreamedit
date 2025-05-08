@@ -39,7 +39,7 @@ def main():
         adapter_name="dog"
     )
     
-    prompt = "sks dog playing fetch in the park"
+    prompt = "big dog playing fetch in the beach"
     negative_prompt = "low quality, blurry, unfinished"
     image = pipe(prompt, num_inference_steps=50, guidance_scale=7, negative_prompt=negative_prompt).images[0]
     image.save("infer_img.jpg")

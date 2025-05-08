@@ -1,20 +1,14 @@
-import argparse
-import gc
 import hashlib
 import itertools
 import logging
 import math
 import os
-import threading
-import warnings
-import yaml
 from contextlib import nullcontext
 from pathlib import Path
 
 import datasets
 import diffusers
 import numpy as np
-import psutil
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -33,13 +27,14 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import HfApi
-from PIL import Image
-from torch.utils.data import Dataset
-from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import AutoTokenizer
 
 from peft import LoraConfig, get_peft_model
+
+from src.dataset import DreamBoothDataset, PromptDataset, collate_fn
+from src.utils import TorchTracemalloc, import_model_class_from_model_name_or_path, b2mb
+from src.args import parse_args
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -50,271 +45,203 @@ logger = get_logger(__name__)
 UNET_TARGET_MODULES = ["to_q", "to_v", "query", "value"]  # , "ff.net.0.proj"]
 TEXT_ENCODER_TARGET_MODULES = ["q_proj", "v_proj"]
 
+def train_step(batch, vae, text_encoder, unet, noise_scheduler, optimizer, lr_scheduler, accelerator, args, weight_dtype):
+    # Convert images to latent space
+    latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+    latents = latents * 0.18215
 
-def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
-    text_encoder_config = PretrainedConfig.from_pretrained(
-        pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=revision,
-    )
-    model_class = text_encoder_config.architectures[0]
+    # Sample noise that we'll add to the latents
+    noise = torch.randn_like(latents)
+    bsz = latents.shape[0]
+    # Sample a random timestep for each image
+    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+    timesteps = timesteps.long()
 
-    if model_class == "CLIPTextModel":
-        from transformers import CLIPTextModel
+    # Add noise to the latents according to the noise magnitude at each timestep
+    # (this is the forward diffusion process)
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        return CLIPTextModel
-    elif model_class == "RobertaSeriesModelWithTransformation":
-        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+    # Get the text embedding for conditioning
+    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-        return RobertaSeriesModelWithTransformation
+    # Predict the noise residual
+    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+    # Get the target for loss depending on the prediction type
+    if noise_scheduler.config.prediction_type == "epsilon":
+        target = noise
+    elif noise_scheduler.config.prediction_type == "v_prediction":
+        target = noise_scheduler.get_velocity(latents, noise, timesteps)
     else:
-        raise ValueError(f"{model_class} is not supported.")
+        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
+    if args.with_prior_preservation:
+        # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+        model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+        target, target_prior = torch.chunk(target, 2, dim=0)
 
-def load_config(config_path):
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    return config
+        # Compute instance loss
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
+        # Compute prior loss
+        prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
 
-def parse_args(input_args=None):
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/default.yaml",
-        help="path if config file",
-    )
-    parser.add_argument(
-        "--pretrained_model_name_or_path",
-        type=str,
-        default=None,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--instance_data_dir",
-        type=str,
-        default=None,
-        help="A folder containing the training data of instance images.",
-    )
-    parser.add_argument(
-        "--instance_prompt",
-        type=str,
-        default=None,
-        help="The prompt with identifier specifying the instance",
-    )
-    
-    if input_args is not None:
-        args = parser.parse_args(input_args)
+        # Add the prior loss to the instance loss.
+        loss = loss + args.prior_loss_weight * prior_loss
     else:
-        args = parser.parse_args()
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+    accelerator.backward(loss)
+    if accelerator.sync_gradients:
+        params_to_clip = (
+            itertools.chain(unet.parameters(), text_encoder.parameters())
+            if args.train_text_encoder
+            else unet.parameters()
+        )
+        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+    optimizer.step()
+    lr_scheduler.step()
+    optimizer.zero_grad()
     
-    config = load_config(args.config)
-    
-    if args.pretrained_model_name_or_path is not None:
-        config["pretrained_model_name_or_path"] = args.pretrained_model_name_or_path
-    if args.instance_data_dir is not None:
-        config["instance_data_dir"] = args.instance_data_dir
-    if args.instance_prompt is not None:
-        config["instance_prompt"] = args.instance_prompt
-    
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != config["local_rank"]:
-        config["local_rank"] = env_local_rank
-    
-    if config["pretrained_model_name_or_path"] is None:
-        raise ValueError("pretrained_model_name_or_path cannot be empty")
-    if config["instance_data_dir"] is None:
-        raise ValueError("instance_data_dir cannot be empty")
-    if config["instance_prompt"] is None:
-        raise ValueError("instance_prompt cannot be empty")
-    
-    if config["with_prior_preservation"]:
-        if config["class_data_dir"] is None:
-            raise ValueError("class_data_dir must be specified when using with_prior_preservation")
-        if config["class_prompt"] is None:
-            raise ValueError("class_prompt must be specified when using with_prior_preservation")
+    return loss
+
+def run_validation(args, accelerator, epoch, step, unet, text_encoder, num_update_steps_per_epoch):
+    logger.info(
+        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+        f" {args.validation_prompt}."
+    )
+    # create pipeline
+    pipeline = DiffusionPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        safety_checker=None,
+        revision=args.revision,
+    )
+    # set `keep_fp32_wrapper` to True because we do not want to remove
+    # mixed precision hooks while we are still training
+    pipeline.unet = accelerator.unwrap_model(unet, keep_fp32_wrapper=True)
+    pipeline.text_encoder = accelerator.unwrap_model(text_encoder, keep_fp32_wrapper=True)
+    pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    # run inference
+    if args.seed is not None:
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
     else:
-        if config["class_data_dir"] is not None:
-            warnings.warn("class_data_dir is not needed without with_prior_preservation")
-        if config["class_prompt"] is not None:
-            warnings.warn("class_prompt is not needed without with_prior_preservation")
+        generator = None
+    images = []
+    for _ in range(args.num_validation_images):
+        image = pipeline(args.validation_prompt, num_inference_steps=25, generator=generator).images[0]
+        images.append(image)
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            np_images = np.stack([np.asarray(img) for img in images])
+            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+        if tracker.name == "wandb":
+            import wandb
+
+            tracker.log(
+                {
+                    "validation": [
+                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
+                        for i, image in enumerate(images)
+                    ]
+                }
+            )
+
+    del pipeline
+    torch.cuda.empty_cache()
+
+def train_epoch(
+    epoch, 
+    train_dataloader, 
+    unet, 
+    text_encoder, 
+    vae, 
+    noise_scheduler, 
+    optimizer, 
+    lr_scheduler, 
+    accelerator, 
+    args, 
+    weight_dtype,
+    global_step, 
+    progress_bar, 
+    num_update_steps_per_epoch, 
+    first_epoch, 
+    resume_step
+):
+    unet.train()
+    if args.train_text_encoder:
+        text_encoder.train()
     
-    return argparse.Namespace(**config)
+    with TorchTracemalloc() if not args.no_tracemalloc else nullcontext() as tracemalloc:
+        for step, batch in enumerate(train_dataloader):
+            # Skip steps until we reach the resumed step
+            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+                if step % args.gradient_accumulation_steps == 0:
+                    progress_bar.update(1)
+                    if args.report_to == "wandb":
+                        accelerator.print(progress_bar)
+                continue
 
+            with accelerator.accumulate(unet):
+                loss = train_step(
+                    batch, 
+                    vae, 
+                    text_encoder, 
+                    unet, 
+                    noise_scheduler, 
+                    optimizer, 
+                    lr_scheduler, 
+                    accelerator, 
+                    args, 
+                    weight_dtype
+                )
 
-# Converting Bytes to Megabytes
-def b2mb(x):
-    return int(x / 2**20)
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                if args.report_to == "wandb":
+                    accelerator.print(progress_bar)
+                global_step += 1
 
+                # if global_step % args.checkpointing_steps == 0:
+                #     if accelerator.is_main_process:
+                #         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                #         accelerator.save_state(save_path)
+                #         logger.info(f"Saved state to {save_path}")
 
-# This context manager is used to track the peak memory usage of the process
-class TorchTracemalloc:
-    def __enter__(self):
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_max_memory_allocated()  # reset the peak gauge to zero
-        self.begin = torch.cuda.memory_allocated()
-        self.process = psutil.Process()
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step)
 
-        self.cpu_begin = self.cpu_mem_used()
-        self.peak_monitoring = True
-        peak_monitor_thread = threading.Thread(target=self.peak_monitor_func)
-        peak_monitor_thread.daemon = True
-        peak_monitor_thread.start()
-        return self
+            if (
+                args.validation_prompt is not None
+                and (step + num_update_steps_per_epoch * epoch) % args.validation_steps == 0
+            ):
+                run_validation(args, accelerator, epoch, step, unet, text_encoder, num_update_steps_per_epoch)
 
-    def cpu_mem_used(self):
-        """get resident set size memory for the current process"""
-        return self.process.memory_info().rss
-
-    def peak_monitor_func(self):
-        self.cpu_peak = -1
-
-        while True:
-            self.cpu_peak = max(self.cpu_mem_used(), self.cpu_peak)
-
-            # can't sleep or will not catch the peak right (this comment is here on purpose)
-            # time.sleep(0.001) # 1msec
-
-            if not self.peak_monitoring:
+            if global_step >= args.max_train_steps:
                 break
-
-    def __exit__(self, *exc):
-        self.peak_monitoring = False
-
-        gc.collect()
-        torch.cuda.empty_cache()
-        self.end = torch.cuda.memory_allocated()
-        self.peak = torch.cuda.max_memory_allocated()
-        self.used = b2mb(self.end - self.begin)
-        self.peaked = b2mb(self.peak - self.begin)
-
-        self.cpu_end = self.cpu_mem_used()
-        self.cpu_used = b2mb(self.cpu_end - self.cpu_begin)
-        self.cpu_peaked = b2mb(self.cpu_peak - self.cpu_begin)
-        # print(f"delta used/peak {self.used:4d}/{self.peaked:4d}")
-
-
-class DreamBoothDataset(Dataset):
-    """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images and the tokenizes prompts.
-    """
-
-    def __init__(
-        self,
-        instance_data_root,
-        instance_prompt,
-        tokenizer,
-        class_data_root=None,
-        class_prompt=None,
-        size=512,
-        center_crop=False,
-    ):
-        self.size = size
-        self.center_crop = center_crop
-        self.tokenizer = tokenizer
-
-        self.instance_data_root = Path(instance_data_root)
-        if not self.instance_data_root.exists():
-            raise ValueError("Instance images root doesn't exists.")
-
-        self.instance_images_path = list(Path(instance_data_root).iterdir())
-        self.num_instance_images = len(self.instance_images_path)
-        self.instance_prompt = instance_prompt
-        self._length = self.num_instance_images
-
-        if class_data_root is not None:
-            self.class_data_root = Path(class_data_root)
-            self.class_data_root.mkdir(parents=True, exist_ok=True)
-            self.class_images_path = list(self.class_data_root.iterdir())
-            self.num_class_images = len(self.class_images_path)
-            self._length = max(self.num_class_images, self.num_instance_images)
-            self.class_prompt = class_prompt
-        else:
-            self.class_data_root = None
-
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
+    
+    # Printing the GPU memory usage details
+    if not args.no_tracemalloc:
+        accelerator.print(f"GPU Memory before entering the train : {b2mb(tracemalloc.begin)}")
+        accelerator.print(f"GPU Memory consumed at the end of the train (end-begin): {tracemalloc.used}")
+        accelerator.print(f"GPU Peak Memory consumed during the train (max-begin): {tracemalloc.peaked}")
+        accelerator.print(
+            f"GPU Total Peak Memory consumed during the train (max): {tracemalloc.peaked + b2mb(tracemalloc.begin)}"
         )
 
-    def __len__(self):
-        return self._length
-
-    def __getitem__(self, index):
-        example = {}
-        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
-        if not instance_image.mode == "RGB":
-            instance_image = instance_image.convert("RGB")
-        example["instance_images"] = self.image_transforms(instance_image)
-        example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_prompt,
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids
-
-        if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
-            example["class_images"] = self.image_transforms(class_image)
-            example["class_prompt_ids"] = self.tokenizer(
-                self.class_prompt,
-                truncation=True,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                return_tensors="pt",
-            ).input_ids
-
-        return example
-
-
-def collate_fn(examples, with_prior_preservation=False):
-    input_ids = [example["instance_prompt_ids"] for example in examples]
-    pixel_values = [example["instance_images"] for example in examples]
-
-    # Concat class and instance examples for prior preservation.
-    # We do this to avoid doing two forward passes.
-    if with_prior_preservation:
-        input_ids += [example["class_prompt_ids"] for example in examples]
-        pixel_values += [example["class_images"] for example in examples]
-
-    pixel_values = torch.stack(pixel_values)
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-    input_ids = torch.cat(input_ids, dim=0)
-
-    batch = {
-        "input_ids": input_ids,
-        "pixel_values": pixel_values,
-    }
-    return batch
-
-
-class PromptDataset(Dataset):
-    "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
-
-    def __init__(self, prompt, num_samples):
-        self.prompt = prompt
-        self.num_samples = num_samples
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, index):
-        example = {}
-        example["prompt"] = self.prompt
-        example["index"] = index
-        return example
-
+        accelerator.print(f"CPU Memory before entering the train : {b2mb(tracemalloc.cpu_begin)}")
+        accelerator.print(f"CPU Memory consumed at the end of the train (end-begin): {tracemalloc.cpu_used}")
+        accelerator.print(f"CPU Peak Memory consumed during the train (max-begin): {tracemalloc.cpu_peaked}")
+        accelerator.print(
+            f"CPU Total Peak Memory consumed during the train (max): {tracemalloc.cpu_peaked + b2mb(tracemalloc.cpu_begin)}"
+        )
+    
+    return global_step
 
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
@@ -633,166 +560,31 @@ def main(args):
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    # 初始化resume_step变量，避免未定义错误
+    resume_step = 0
+
     for epoch in range(first_epoch, args.num_train_epochs):
-        unet.train()
-        if args.train_text_encoder:
-            text_encoder.train()
-        with TorchTracemalloc() if not args.no_tracemalloc else nullcontext() as tracemalloc:
-            for step, batch in enumerate(train_dataloader):
-                # Skip steps until we reach the resumed step
-                if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-                    if step % args.gradient_accumulation_steps == 0:
-                        progress_bar.update(1)
-                        if args.report_to == "wandb":
-                            accelerator.print(progress_bar)
-                    continue
-
-                with accelerator.accumulate(unet):
-                    # Convert images to latent space
-                    latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
-                    latents = latents * 0.18215
-
-                    # Sample noise that we'll add to the latents
-                    noise = torch.randn_like(latents)
-                    bsz = latents.shape[0]
-                    # Sample a random timestep for each image
-                    timesteps = torch.randint(
-                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
-                    )
-                    timesteps = timesteps.long()
-
-                    # Add noise to the latents according to the noise magnitude at each timestep
-                    # (this is the forward diffusion process)
-                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                    # Get the text embedding for conditioning
-                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
-                    # Predict the noise residual
-                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-                    # Get the target for loss depending on the prediction type
-                    if noise_scheduler.config.prediction_type == "epsilon":
-                        target = noise
-                    elif noise_scheduler.config.prediction_type == "v_prediction":
-                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                    else:
-                        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                    if args.with_prior_preservation:
-                        # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                        model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                        target, target_prior = torch.chunk(target, 2, dim=0)
-
-                        # Compute instance loss
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-                        # Compute prior loss
-                        prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
-
-                        # Add the prior loss to the instance loss.
-                        loss = loss + args.prior_loss_weight * prior_loss
-                    else:
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-                    accelerator.backward(loss)
-                    if accelerator.sync_gradients:
-                        params_to_clip = (
-                            itertools.chain(unet.parameters(), text_encoder.parameters())
-                            if args.train_text_encoder
-                            else unet.parameters()
-                        )
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
-
-                # Checks if the accelerator has performed an optimization step behind the scenes
-                if accelerator.sync_gradients:
-                    progress_bar.update(1)
-                    if args.report_to == "wandb":
-                        accelerator.print(progress_bar)
-                    global_step += 1
-
-                    # if global_step % args.checkpointing_steps == 0:
-                    #     if accelerator.is_main_process:
-                    #         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    #         accelerator.save_state(save_path)
-                    #         logger.info(f"Saved state to {save_path}")
-
-                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
-                accelerator.log(logs, step=global_step)
-
-                if (
-                    args.validation_prompt is not None
-                    and (step + num_update_steps_per_epoch * epoch) % args.validation_steps == 0
-                ):
-                    logger.info(
-                        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-                        f" {args.validation_prompt}."
-                    )
-                    # create pipeline
-                    pipeline = DiffusionPipeline.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        safety_checker=None,
-                        revision=args.revision,
-                    )
-                    # set `keep_fp32_wrapper` to True because we do not want to remove
-                    # mixed precision hooks while we are still training
-                    pipeline.unet = accelerator.unwrap_model(unet, keep_fp32_wrapper=True)
-                    pipeline.text_encoder = accelerator.unwrap_model(text_encoder, keep_fp32_wrapper=True)
-                    pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
-                    pipeline = pipeline.to(accelerator.device)
-                    pipeline.set_progress_bar_config(disable=True)
-
-                    # run inference
-                    if args.seed is not None:
-                        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-                    else:
-                        generator = None
-                    images = []
-                    for _ in range(args.num_validation_images):
-                        image = pipeline(args.validation_prompt, num_inference_steps=25, generator=generator).images[0]
-                        images.append(image)
-
-                    for tracker in accelerator.trackers:
-                        if tracker.name == "tensorboard":
-                            np_images = np.stack([np.asarray(img) for img in images])
-                            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-                        if tracker.name == "wandb":
-                            import wandb
-
-                            tracker.log(
-                                {
-                                    "validation": [
-                                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-                                        for i, image in enumerate(images)
-                                    ]
-                                }
-                            )
-
-                    del pipeline
-                    torch.cuda.empty_cache()
-
-                if global_step >= args.max_train_steps:
-                    break
-        # Printing the GPU memory usage details such as allocated memory, peak memory, and total memory usage
-
-        if not args.no_tracemalloc:
-            accelerator.print(f"GPU Memory before entering the train : {b2mb(tracemalloc.begin)}")
-            accelerator.print(f"GPU Memory consumed at the end of the train (end-begin): {tracemalloc.used}")
-            accelerator.print(f"GPU Peak Memory consumed during the train (max-begin): {tracemalloc.peaked}")
-            accelerator.print(
-                f"GPU Total Peak Memory consumed during the train (max): {tracemalloc.peaked + b2mb(tracemalloc.begin)}"
-            )
-
-            accelerator.print(f"CPU Memory before entering the train : {b2mb(tracemalloc.cpu_begin)}")
-            accelerator.print(f"CPU Memory consumed at the end of the train (end-begin): {tracemalloc.cpu_used}")
-            accelerator.print(f"CPU Peak Memory consumed during the train (max-begin): {tracemalloc.cpu_peaked}")
-            accelerator.print(
-                f"CPU Total Peak Memory consumed during the train (max): {tracemalloc.cpu_peaked + b2mb(tracemalloc.cpu_begin)}"
-            )
+        global_step = train_epoch(
+            epoch=epoch,
+            train_dataloader=train_dataloader,
+            unet=unet,
+            text_encoder=text_encoder,
+            vae=vae,
+            noise_scheduler=noise_scheduler,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            accelerator=accelerator,
+            args=args,
+            weight_dtype=weight_dtype,
+            global_step=global_step,
+            progress_bar=progress_bar,
+            num_update_steps_per_epoch=num_update_steps_per_epoch,
+            first_epoch=first_epoch,
+            resume_step=resume_step
+        )
+        
+        if global_step >= args.max_train_steps:
+            break
 
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
