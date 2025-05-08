@@ -1,0 +1,9 @@
+pretrained_model_name_or_path: "CompVis/stable-diffusion-v1-4"   
+
+instance_data_dir: null  
+class_data_dir: null  
+
+instance_prompt: "a photo of sks dog"  
+class_prompt: "a photo of dog"  
+
+output_dir: "results"  
