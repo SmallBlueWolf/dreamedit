@@ -8,24 +8,36 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics.pairwise import cosine_similarity
 import json
-import random  # 导入random用于生成随机种子
+import random
+import yaml
 
 from diffusers import StableDiffusionPipeline
 from peft import PeftModel
 import clip
-# 对于DINO特征提取，需要导入正确的模型
+
 from torchvision.models import vision_transformer, vit_b_16, ViT_B_16_Weights
 from torchvision.models._utils import IntermediateLayerGetter
 
-# 导入torch hub以便加载DINO模型
 import torch.hub
 
-# 从inference.py导入已有的函数
 from inference import get_lora_sd_pipeline
 
+def load_config(config_path):
+    if not os.path.exists(config_path):
+        print(f"警告: 配置文件 {config_path} 不存在，使用默认参数")
+        return {}
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    return config
+
 def parse_args():
+    config_path = 'configs/default.yaml'
+    config = load_config(config_path)
+    
     parser = argparse.ArgumentParser(description='评估微调后的DreamBooth模型')
-    parser.add_argument('--lora_path', type=str, default='results', 
+    parser.add_argument('--lora_path', type=str, default=None, 
                         help='微调LoRA模型路径（已弃用，建议使用--weight_root）')
     parser.add_argument('--weight_root', type=str, default='eval_weights',
                         help='所有微调权重的根目录，每个主体权重应在weight_root/主体名/')
@@ -39,9 +51,9 @@ def parse_args():
                         help='LoRA适配器名称')
     parser.add_argument('--identifier_token', type=str, default='sks', 
                         help='唯一标识符token，例如：sks')
-    parser.add_argument('--images_per_prompt', type=int, default=4, 
+    parser.add_argument('--images_per_prompt', type=int, default=config.get('sample_batch_size', 4), 
                         help='每个提示词生成的图像数量')
-    parser.add_argument('--inference_steps', type=int, default=50, 
+    parser.add_argument('--inference_steps', type=int, default=config.get('validation_steps', 50), 
                         help='推理步数')
     parser.add_argument('--guidance_scale', type=float, default=7.0, 
                         help='引导比例')
@@ -53,7 +65,38 @@ def parse_args():
                         help='是否为活体对象（使用活体专用提示词）')
     parser.add_argument('--skip_existing', action='store_true',
                         help='跳过已有评估结果的主体')
-    return parser.parse_args()
+    parser.add_argument('--config', type=str, default=config_path,
+                        help='指定自定义配置文件路径')
+    parser.add_argument('--base_model', type=str, default='CompVis/stable-diffusion-v1-4',
+                        help='基础模型路径，用于加载微调模型')
+    
+    args = parser.parse_args()
+    
+    # 如果指定了自定义配置文件，加载并更新配置
+    if args.config and args.config != config_path:
+        custom_config = load_config(args.config)
+        if custom_config:
+            config.update(custom_config)
+    
+    # 将配置文件中的值应用到args
+    if not hasattr(args, 'resolution'):
+        args.resolution = config.get('resolution', 512)
+    
+    # 更新其他可能的参数
+    if not hasattr(args, 'use_lora'):
+        args.use_lora = config.get('use_lora', True)
+    
+    # LoRA相关参数
+    args.lora_r = config.get('lora_r', 16)
+    args.lora_alpha = config.get('lora_alpha', 27)
+    args.lora_dropout = config.get('lora_dropout', 0.0)
+    args.lora_bias = config.get('lora_bias', 'none')
+    args.lora_text_encoder_r = config.get('lora_text_encoder_r', 16)
+    args.lora_text_encoder_alpha = config.get('lora_text_encoder_alpha', 17)
+    args.lora_text_encoder_dropout = config.get('lora_text_encoder_dropout', 0.0)
+    args.lora_text_encoder_bias = config.get('lora_text_encoder_bias', 'none')
+    
+    return args
 
 def load_prompts_and_classes(file_path, is_live_subject=False):
     """加载提示词和类别"""
@@ -269,6 +312,9 @@ def evaluate_subject(args, subject_name, class_word, is_live_subject_flag, model
     print(f"- 唯一标识符: {args.identifier_token}")
     print(f"- 评估提示词数量: {len(prompts_templates)}")
     print(f"- 每个提示词生成图像数: {args.images_per_prompt}")
+    print(f"- 推理步数: {args.inference_steps}")
+    print(f"- 引导比例: {args.guidance_scale}")
+    print(f"- 分辨率: {args.resolution if hasattr(args, 'resolution') else 512}")
     
     # 加载主体参考图像
     transform = transforms.Compose([
@@ -322,13 +368,16 @@ def evaluate_subject(args, subject_name, class_word, is_live_subject_flag, model
                     seed = random.randint(1, 2147483647)
                     generator = torch.Generator(device=device).manual_seed(seed)
                     
-                    # 使用随机种子生成图像
+                    # 使用随机种子生成图像，添加对分辨率的支持
+                    height = width = getattr(args, 'resolution', 512)
                     output = pipe(
                         prompt, 
                         num_inference_steps=args.inference_steps, 
                         guidance_scale=args.guidance_scale, 
                         negative_prompt=negative_prompt,
-                        generator=generator
+                        generator=generator,
+                        height=height,
+                        width=width
                     )
                     
                     # 获取生成的图像
@@ -408,6 +457,19 @@ def evaluate_subject(args, subject_name, class_word, is_live_subject_flag, model
     import json
     result_dir = os.path.join(args.result_dir, subject_name)
     os.makedirs(result_dir, exist_ok=True)
+    
+    # 获取更多配置信息进行保存
+    lora_config = {}
+    if hasattr(args, 'use_lora') and args.use_lora:
+        lora_config = {
+            "lora_r": getattr(args, 'lora_r', 16),
+            "lora_alpha": getattr(args, 'lora_alpha', 27),
+            "lora_dropout": getattr(args, 'lora_dropout', 0.0),
+            "lora_bias": getattr(args, 'lora_bias', 'none'),
+            "lora_text_encoder_r": getattr(args, 'lora_text_encoder_r', 16),
+            "lora_text_encoder_alpha": getattr(args, 'lora_text_encoder_alpha', 17)
+        }
+    
     with open(f"{result_dir}/metrics.json", "w") as f:
         json.dump({
             "detailed": results,
@@ -419,11 +481,47 @@ def evaluate_subject(args, subject_name, class_word, is_live_subject_flag, model
                 "identifier_token": args.identifier_token,
                 "inference_steps": args.inference_steps,
                 "guidance_scale": args.guidance_scale,
-                "images_per_prompt": args.images_per_prompt
+                "images_per_prompt": args.images_per_prompt,
+                "resolution": getattr(args, 'resolution', 512),
+                "lora": lora_config
             }
         }, f, indent=2)
     
     return subject_name, avg_results
+
+def find_weights_path(weight_root, subject_name, class_word):
+    """
+    查找主体或类别的权重路径
+    优先查找主体专属权重，如果不存在则查找类别权重
+    
+    参数:
+        weight_root: str - 权重根目录
+        subject_name: str - 主体名称
+        class_word: str - 主体类别名称
+        
+    返回:
+        str - 权重路径，若未找到则返回None
+    """
+    # 首先尝试查找主体专属权重
+    subject_weight_path = os.path.join(weight_root, subject_name)
+    if os.path.exists(subject_weight_path):
+        return subject_weight_path, f"主体 {subject_name} 的专属权重"
+    
+    # 如果主体权重不存在，尝试查找类别权重
+    class_weight_path = os.path.join(weight_root, class_word)
+    if os.path.exists(class_weight_path):
+        return class_weight_path, f"类别 {class_word} 的通用权重"
+    
+    # 如果类别是复合词，尝试查找主要类别词的权重
+    # 例如 "white dog" -> "dog"
+    if " " in class_word:
+        main_class = class_word.split()[-1]  # 取最后一个词作为主要类别
+        main_class_path = os.path.join(weight_root, main_class)
+        if os.path.exists(main_class_path):
+            return main_class_path, f"主要类别 {main_class} 的通用权重"
+    
+    # 都找不到则返回None
+    return None, None
 
 def main():
     # 解析命令行参数
@@ -473,6 +571,18 @@ def main():
     # 存储每个主体的评估结果
     all_results = {}
     
+    # 打印评估配置信息
+    print("\n====== 评估配置 ======")
+    print(f"基础模型: {args.base_model}")
+    print(f"权重目录: {args.weight_root}")
+    print(f"推理步数: {args.inference_steps}")
+    print(f"引导比例: {args.guidance_scale}")
+    print(f"每个提示词图像数: {args.images_per_prompt}")
+    print(f"图像分辨率: {getattr(args, 'resolution', 512)}")
+    if hasattr(args, 'use_lora') and args.use_lora:
+        print(f"使用LoRA: 是 (rank={getattr(args, 'lora_r', 16)}, alpha={getattr(args, 'lora_alpha', 27)})")
+    print("=====================\n")
+    
     # 添加最外层的总进度条，显示整体评估进度
     total_progress = tqdm(total=len(subject_list), desc="总体评估进度", position=0, leave=True)
     
@@ -496,16 +606,20 @@ def main():
         # 判断是否为活体主体
         subject_is_live = args.is_live_subject or is_live_subject(subject_name, classes_map)
         
-        # 每个主体动态加载其专属权重
-        lora_path = os.path.join(args.weight_root, subject_name)
-        if not os.path.exists(lora_path):
-            print(f"警告: 未找到主体 {subject_name} 的权重目录: {lora_path}，跳过该主体")
+        # 查找合适的权重路径 - 优先使用主体专属权重，其次是类别权重
+        lora_path, source_desc = find_weights_path(args.weight_root, subject_name, class_word)
+        
+        if not lora_path:
+            print(f"警告: 未找到主体 {subject_name} 或类别 {class_word} 的权重目录，跳过该主体")
             total_progress.update(1)
             continue
-        print(f"加载微调后的模型 from {lora_path}...")
+            
+        print(f"加载微调后的模型 from {lora_path} ({source_desc})...")
         try:
+            # 使用指定的基础模型
             pipe = get_lora_sd_pipeline(
                 lora_path,
+                base_model_name_or_path=args.base_model,  # 使用命令行参数指定的基础模型
                 adapter_name=args.adapter_name
             )
         except Exception as e:
@@ -542,6 +656,17 @@ def main():
         print(f"平均 CLIP-I 分数 (主体保真度): {avg_clip_i:.4f}")
         print(f"平均 CLIP-T 分数 (提示词匹配度): {avg_clip_t:.4f}")
         
+        # 收集配置信息
+        config_info = {k: v for k, v in vars(args).items() if not k.startswith('_')}
+        # 确保特殊结构可以序列化为JSON
+        for k, v in config_info.items():
+            if isinstance(v, (np.ndarray, np.number)):
+                config_info[k] = float(v)
+            elif isinstance(v, (set, frozenset)):
+                config_info[k] = list(v)
+            elif not isinstance(v, (str, int, float, bool, list, dict, type(None))):
+                config_info[k] = str(v)
+        
         # 保存总体结果
         with open(f"{args.result_dir}/overall_metrics.json", "w") as f:
             json.dump({
@@ -551,7 +676,7 @@ def main():
                     "avg_clip_i_score": float(avg_clip_i),
                     "avg_clip_t_score": float(avg_clip_t)
                 },
-                "config": vars(args)
+                "config": config_info
             }, f, indent=2)
 
 if __name__ == "__main__":

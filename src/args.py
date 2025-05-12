@@ -6,7 +6,7 @@ from pathlib import Path
 from src.utils import load_config
 
 def parse_args(input_args=None):
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser = argparse.ArgumentParser(description="Script to train a model using DreamBooth.")
     parser.add_argument(
         "--config",
         type=str,

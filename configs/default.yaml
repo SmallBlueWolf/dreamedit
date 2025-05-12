@@ -11,6 +11,12 @@ resolution: 512
 center_crop: false  
 train_text_encoder: true  
 
+# AlphaEdit相关设置
+use_alphaedit: false
+alphaedit_knowledge_dir: null
+alphaedit_samples: 1000
+alphaedit_threshold: 1e-5
+
 use_lora: true  
 lora_r: 16  
 lora_alpha: 27  

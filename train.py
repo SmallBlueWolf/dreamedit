@@ -45,6 +45,319 @@ logger = get_logger(__name__)
 UNET_TARGET_MODULES = ["to_q", "to_v", "query", "value"]  # , "ff.net.0.proj"]
 TEXT_ENCODER_TARGET_MODULES = ["q_proj", "v_proj"]
 
+def compute_projection_matrix(embeddings, threshold=1e-5):
+    """
+    计算投影矩阵，基于AlphaEdit方法。
+    
+    注意：保留此函数是为了向后兼容，现在它只是简单地调用compute_projection_matrices。
+    
+    Args:
+        embeddings: 知识表示的嵌入向量 [batch_size, embed_dim]
+        threshold: 特征值筛选的阈值
+        
+    Returns:
+        projection_matrix: 投影矩阵，用于将扰动投影到零空间
+    """
+    # 确保threshold是浮点数
+    threshold = float(threshold)
+    
+    # 将embeddings包装在列表中，模拟单层情况
+    layer_embeddings = [embeddings]
+    
+    # 调用新函数计算投影矩阵
+    projection_matrices = compute_projection_matrices(layer_embeddings, threshold)
+    
+    # 返回唯一的投影矩阵
+    if projection_matrices and projection_matrices[0] is not None:
+        return projection_matrices[0]
+    
+    # 如果出错，返回单位矩阵
+    logger.warning("Failed to compute projection matrix, returning identity matrix")
+    return torch.eye(embeddings.shape[1], device=embeddings.device)
+
+def find_cross_attention_layers(unet):
+    """
+    查找UNet中所有交叉注意力层
+    
+    Args:
+        unet: UNet模型
+        
+    Returns:
+        ca_layers: 交叉注意力层列表
+    """
+    # 首先添加一些调试信息，了解模型结构
+    logger.info(f"Searching for cross-attention layers in model: {type(unet).__name__}")
+    
+    # 用于存储找到的交叉注意力层
+    ca_layers = []
+    
+    # 检查是否是使用LoRA包装的模型
+    is_peft_model = "peft" in str(type(unet)).lower()
+    if is_peft_model:
+        logger.info("Detected PEFT/LoRA model, adjusting search strategy")
+        # 如果是PEFT模型，我们需要查找base_model
+        if hasattr(unet, "base_model"):
+            base_model = unet.base_model
+            logger.info(f"Found base_model: {type(base_model).__name__}")
+            # 递归查找
+            if hasattr(base_model, "model"):
+                logger.info("Searching in base_model.model")
+                actual_model = base_model.model
+            else:
+                logger.info("Using base_model directly")
+                actual_model = base_model
+        else:
+            logger.info("No base_model found, using unet directly")
+            actual_model = unet
+    else:
+        logger.info("Using standard UNet model")
+        actual_model = unet
+    
+    # 特定于StableDiffusion UNet的交叉注意力层定位
+    # 注意：我们需要找到正确的父模块，而不是子组件
+    target_modules = []
+    
+    # 收集所有疑似CrossAttention模块
+    for name, module in actual_model.named_modules():
+        # 只考虑可能是交叉注意力的模块，跳过子组件
+        if 'attn2' in name and not any(x in name for x in ['.to_', '.processor']):
+            target_modules.append((name, module))
+            logger.info(f"Found potential cross-attention module: {name}, type: {type(module).__name__}")
+    
+    # 现在检查每个疑似模块是否具有必要的属性
+    for name, module in target_modules:
+        # 检查基本属性
+        has_to_v = hasattr(module, 'to_v')
+        has_to_q = hasattr(module, 'to_q')
+        has_to_k = hasattr(module, 'to_k')
+        
+        # 详细的调试信息
+        logger.info(f"Checking module {name}: has_to_v={has_to_v}, has_to_q={has_to_q}, has_to_k={has_to_k}")
+        
+        # 确认这是一个完整的交叉注意力模块
+        if has_to_v and has_to_q and has_to_k:
+            # 再次检查to_v是否有weight属性
+            if hasattr(module.to_v, 'weight'):
+                ca_layers.append((name, module))
+                logger.info(f"✅ Confirmed cross-attention layer: {name}")
+            else:
+                logger.warning(f"❌ Module {name} has to_v but no weight attribute")
+        else:
+            logger.warning(f"❌ Module {name} is not a complete cross-attention module")
+    
+    logger.info(f"Found {len(ca_layers)} valid cross-attention layers")
+    return ca_layers
+
+def collect_layer_specific_embeddings(unet, text_encoder, tokenizer, prompts, device, batch_size=16):
+    """
+    为UNet中的每个交叉注意力层收集特定的知识嵌入。
+    
+    Args:
+        unet: UNet模型
+        text_encoder: 文本编码器模型
+        tokenizer: 分词器
+        prompts: 表示知识的文本提示列表
+        device: 计算设备
+        batch_size: 批处理大小
+        
+    Returns:
+        layer_embeddings: 每一层的知识嵌入字典，键为维度大小
+        dimensions: 每一层投影矩阵应有的维度
+    """
+    # 获取UNet中所有的交叉注意力层
+    ca_layers = find_cross_attention_layers(unet)
+    
+    if not ca_layers:
+        raise ValueError("No valid cross-attention layers found in UNet. Cannot proceed with AlphaEdit.")
+    
+    logger.info(f"Found {len(ca_layers)} valid cross-attention layers in UNet")
+    
+    # 提取每层权重的维度
+    layer_dimensions = []
+    unique_out_dimensions = set()  # 改为收集输出维度
+    
+    for name, layer in ca_layers:
+        # 不再需要检查to_v属性，因为find_cross_attention_layers已经确保了这一点
+        weight = layer.to_v.weight
+        out_dim, in_dim = weight.shape
+        logger.info(f"Layer {name}: weight shape torch.Size([{out_dim}, {in_dim}])")
+        layer_dimensions.append((out_dim, in_dim))
+        unique_out_dimensions.add(out_dim)  # 存储输出维度
+    
+    # 验证已找到所有需要的维度
+    if not unique_out_dimensions:
+        raise ValueError("Failed to detect any valid dimensions from UNet layers")
+    
+    logger.info(f"Detected unique output dimensions: {unique_out_dimensions}")
+    
+    # 获取text_encoder的输出维度（通常是768用于CLIP）
+    text_encoder_dim = None
+    with torch.no_grad():
+        # 对单个提示进行编码
+        sample_text = tokenizer(
+            prompts[0],
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+        sample_text = {k: v.to(device) for k, v in sample_text.items()}
+        text_encoder_output = text_encoder(sample_text['input_ids'])[0]
+        text_encoder_dim = text_encoder_output.shape[-1]  # 通常是768
+    
+    logger.info(f"Text encoder output dimension: {text_encoder_dim}")
+    
+    # 处理每个提示词，收集text_encoder的输出
+    all_text_embeddings = []
+    
+    for i in tqdm(range(0, len(prompts), batch_size), desc="Collecting text embeddings"):
+        batch_prompts = prompts[i:i + batch_size]
+        
+        # 对提示进行编码
+        text_inputs = tokenizer(
+            batch_prompts,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        # 确保输入在正确的设备上
+        text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+        
+        # 获取文本编码
+        with torch.no_grad():
+            # 确认text_encoder是否在正确设备上
+            text_encoder_device = next(text_encoder.parameters()).device
+            if text_encoder_device != device:
+                logger.warning(f"Text encoder on {text_encoder_device} but inputs on {device}. Moving text encoder.")
+                text_encoder = text_encoder.to(device)
+                
+            # 获取文本嵌入
+            text_embeddings = text_encoder(text_inputs['input_ids'])[0].detach()
+            
+            # 提取每个序列的嵌入
+            for j, input_ids in enumerate(text_inputs['input_ids']):
+                # 找到序列的实际长度（排除padding标记）
+                seq_len = (input_ids != tokenizer.pad_token_id).sum().item()
+                
+                # 获取最后一个非padding标记的嵌入
+                token_embedding = text_embeddings[j, seq_len-1, :].unsqueeze(0)
+                all_text_embeddings.append(token_embedding)
+    
+    # 合并所有文本嵌入
+    if all_text_embeddings:
+        base_text_embeddings = torch.cat(all_text_embeddings, dim=0)
+        logger.info(f"Collected {base_text_embeddings.shape[0]} text embeddings of dimension {base_text_embeddings.shape[1]}")
+    else:
+        raise ValueError("No text embeddings were collected!")
+    
+    # 创建投影矩阵生成器，用于为不同维度创建正交基
+    def create_orthogonal_basis(dim, num_vectors, device):
+        # 创建随机矩阵
+        rand_matrix = torch.randn(dim, num_vectors, device=device)
+        # 使用QR分解获取正交基
+        q, _ = torch.linalg.qr(rand_matrix)
+        return q
+    
+    # 为每个独特的输出维度创建特定的嵌入和投影矩阵
+    dimension_embeddings = {}
+    
+    logger.info("Creating dimension-specific embeddings for gradient dimensions...")
+    
+    for dim in unique_out_dimensions:
+        # 创建适当大小的随机嵌入
+        # 我们需要为每个输出维度创建对应的嵌入和投影矩阵
+        # 这个嵌入矩阵的目的是为了捕捉知识在这个特定维度上的表示
+        num_samples = base_text_embeddings.shape[0]
+        
+        # 从文本嵌入投影到目标维度的嵌入空间
+        if text_encoder_dim != dim:
+            logger.info(f"Creating projection from text embeddings ({text_encoder_dim}) to dimension {dim}")
+            projection = torch.nn.Linear(text_encoder_dim, dim, bias=False).to(device)
+            torch.nn.init.orthogonal_(projection.weight)
+            
+            with torch.no_grad():
+                dim_embeddings = projection(base_text_embeddings)
+        else:
+            # 如果维度匹配，直接使用
+            logger.info(f"Using text encoder embeddings directly for dimension {dim}")
+            dim_embeddings = base_text_embeddings
+            
+        # 存储这个维度的嵌入
+        dimension_embeddings[dim] = dim_embeddings
+    
+    return dimension_embeddings, layer_dimensions
+
+def compute_projection_matrices(embeddings_dict, dimensions, threshold=1e-5):
+    """
+    为每一层计算专属的投影矩阵。
+    
+    Args:
+        embeddings_dict: 每个维度的知识嵌入字典
+        dimensions: 每一层的维度元组列表 (out_dim, in_dim)
+        threshold: 特征值筛选的阈值
+        
+    Returns:
+        projection_matrices: 每层的投影矩阵列表
+    """
+    projection_matrices = []
+    
+    # 确保阈值是浮点数
+    threshold_value = float(threshold)
+    
+    # 为每个输出维度计算基础投影矩阵
+    dimension_projections = {}
+    
+    # 计算每个维度的基础投影矩阵
+    for dim, embeddings in embeddings_dict.items():
+        device = embeddings.device
+        
+        # 计算非中心协方差矩阵
+        product = embeddings.T @ embeddings
+        
+        # 对协方差矩阵进行SVD分解
+        try:
+            U, S, _ = torch.linalg.svd(product, full_matrices=False)
+            
+            # 获取小于阈值的特征值对应的特征向量
+            mask = S < threshold_value
+            smallest_indices = mask.nonzero().squeeze()
+            
+            if len(smallest_indices) == 0 or smallest_indices.numel() == 0:
+                # 计算保留10%特征向量的数量
+                k = max(1, int(0.1 * len(S)))
+                smallest_indices = torch.argsort(S)[:k]
+                logger.info(f"No eigenvalues below threshold for dim {dim}. Using smallest {k} eigenvalues.")
+            else:
+                logger.info(f"Found {len(smallest_indices)} eigenvalues below threshold for dim {dim}")
+            
+            # 构建投影矩阵
+            U_smallest = U[:, smallest_indices]
+            projection = U_smallest @ U_smallest.T
+            
+            dimension_projections[dim] = projection
+            logger.info(f"Created base projection for dimension {dim} with shape {projection.shape}")
+            
+        except Exception as e:
+            # 不再使用备用方案，直接抛出错误
+            raise ValueError(f"Error computing projection matrix for dimension {dim}: {e}")
+    
+    # 为每一层分配对应维度的投影矩阵
+    for layer_idx, (out_dim, in_dim) in enumerate(dimensions):
+        if out_dim in dimension_projections:  # 使用输出维度匹配
+            projection_matrices.append(dimension_projections[out_dim])
+            logger.info(f"Layer {layer_idx}: Using projection matrix for output dimension {out_dim}")
+        else:
+            # 找不到匹配的维度，抛出错误
+            raise ValueError(f"Layer {layer_idx}: Cannot find projection matrix for dimension {out_dim}")
+    
+    # 验证所有层都有对应的投影矩阵
+    if len(projection_matrices) != len(dimensions):
+        raise ValueError(f"Not all layers have projection matrices: {len(projection_matrices)}/{len(dimensions)}")
+    
+    return projection_matrices
+
 def train_step(batch, vae, text_encoder, unet, noise_scheduler, optimizer, lr_scheduler, accelerator, args, weight_dtype):
     # Convert images to latent space
     latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
@@ -63,7 +376,62 @@ def train_step(batch, vae, text_encoder, unet, noise_scheduler, optimizer, lr_sc
 
     # Get the text embedding for conditioning
     encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
+    
+    # 如果使用AlphaEdit，并且模型已初始化投影矩阵，应用投影矩阵修改嵌入向量
+    if hasattr(args, 'use_alphaedit') and args.use_alphaedit and hasattr(unet, 'projection_matrices'):
+        # 应用投影矩阵到交叉注意力层权重的梯度
+        # 这是实现空间约束的关键步骤
+        with torch.no_grad():
+            # 获取所有交叉注意力层
+            ca_layers = find_cross_attention_layers(unet)
+            
+            # 建立模块到投影矩阵索引的映射
+            module_to_idx = {module: idx for idx, (_, module) in enumerate(ca_layers)}
+            
+            # 模块投影矩阵缓存，避免重复创建
+            module_projections = {}
+            
+            # 使用钩子在反向传播时应用投影
+            def hook_fn(module, grad_input, grad_output):
+                try:
+                    # 如果没有梯度输入，直接返回
+                    if grad_input is None or len(grad_input) == 0 or grad_input[0] is None:
+                        return grad_input
+                    
+                    # 使用预先计算的映射直接获取对应的投影矩阵
+                    if hasattr(unet, 'layer_to_matrix_map') and module in unet.layer_to_matrix_map:
+                        P = unet.layer_to_matrix_map[module]
+                        
+                        # 确保设备和类型匹配
+                        P = P.to(grad_output[0].device, grad_output[0].dtype)
+                        
+                        # 获取梯度输入的形状和维度
+                        grad_dim = grad_input[0].shape[-1]
+                        
+                        # 验证投影矩阵维度是否匹配梯度维度
+                        if P.shape[0] != grad_dim:
+                            raise ValueError(f"Projection matrix dimension {P.shape[0]} doesn't match "
+                                            f"gradient input dimension {grad_dim}")
+                        
+                        # 应用投影矩阵
+                        if len(grad_input) > 1:
+                            return (grad_input[0] @ P, *grad_input[1:])
+                        else:
+                            return (grad_input[0] @ P,)
+                    else:
+                        # 如果映射中没有该模块，抛出错误
+                        raise ValueError(f"Module {module.__class__.__name__} not found in layer_to_matrix_map")
+                except Exception as e:
+                    logger.error(f"Error in AlphaEdit hook: {e}")
+                    # 出错时抛出异常，而不是静默使用原始梯度
+                    raise
+            
+            # 为UNet中的交叉注意力模块注册钩子
+            hooks = []
+            ca_layers = find_cross_attention_layers(unet)
+            for _, module in ca_layers:
+                hooks.append(module.register_full_backward_hook(hook_fn))
+    
     # Predict the noise residual
     model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
@@ -102,6 +470,11 @@ def train_step(batch, vae, text_encoder, unet, noise_scheduler, optimizer, lr_sc
     optimizer.step()
     lr_scheduler.step()
     optimizer.zero_grad()
+    
+    # 如果使用AlphaEdit，清除注册的钩子
+    if hasattr(args, 'use_alphaedit') and args.use_alphaedit and hasattr(unet, 'projection_matrices') and 'hooks' in locals():
+        for hook in hooks:
+            hook.remove()
     
     return loss
 
@@ -229,7 +602,7 @@ def train_epoch(
     if not args.no_tracemalloc:
         accelerator.print(f"GPU Memory before entering the train : {b2mb(tracemalloc.begin)}")
         accelerator.print(f"GPU Memory consumed at the end of the train (end-begin): {tracemalloc.used}")
-        accelerator.print(f"GPU Peak Memory consumed during the train (max-begin): {tracemalloc.peaked}")
+        accelerator.print(f"GPU Memory peaked during the train (max-begin): {tracemalloc.peaked}")
         accelerator.print(
             f"GPU Total Peak Memory consumed during the train (max): {tracemalloc.peaked + b2mb(tracemalloc.begin)}"
         )
@@ -242,6 +615,64 @@ def train_epoch(
         )
     
     return global_step
+
+def collect_knowledge_embeddings(text_encoder, tokenizer, prompts, device, batch_size=16):
+    """
+    收集知识表示的嵌入向量。
+    
+    注意：此函数保留为向后兼容，实际会调用collect_layer_specific_embeddings。
+    
+    Args:
+        text_encoder: 文本编码器模型
+        tokenizer: 分词器
+        prompts: 表示知识的文本提示列表
+        device: 计算设备
+        batch_size: 批处理大小
+        
+    Returns:
+        total_embeddings: 收集到的嵌入向量 [n_prompts, embed_dim]
+    """
+    logger.warning("collect_knowledge_embeddings被调用，但现在推荐使用collect_layer_specific_embeddings")
+    
+    # 初始化一个简单的UNet，仅用于收集embeddings
+    from diffusers import UNet2DConditionModel
+    
+    # 创建一个临时UNet
+    unet = UNet2DConditionModel(
+        sample_size=64,
+        in_channels=4,
+        out_channels=4,
+        layers_per_block=2,
+        block_out_channels=(128, 128, 256, 256, 512, 512),
+        down_block_types=(
+            "DownBlock2D",
+            "DownBlock2D",
+            "DownBlock2D",
+            "DownBlock2D",
+            "AttnDownBlock2D",
+            "DownBlock2D",
+        ),
+        up_block_types=(
+            "UpBlock2D",
+            "AttnUpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
+        ),
+    )
+    unet.to(device)
+    
+    # 调用新方法
+    layer_embeddings, dimensions = collect_layer_specific_embeddings(unet, text_encoder, tokenizer, prompts, device, batch_size)
+    
+    # 返回第一个有效的嵌入
+    for embeddings in layer_embeddings.values():
+        if embeddings is not None and embeddings.numel() > 0:
+            return embeddings
+    
+    # 如果没有有效的嵌入，抛出错误
+    raise ValueError("未能收集有效的知识嵌入")
 
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
@@ -406,6 +837,111 @@ def main(args):
         text_encoder = get_peft_model(text_encoder, config)
         text_encoder.print_trainable_parameters()
         # print(text_encoder)
+
+    # 实现AlphaEdit功能
+    if hasattr(args, 'use_alphaedit') and args.use_alphaedit:
+        logger.info("AlphaEdit mode enabled. Initializing projection matrices...")
+        
+        # 检查是否提供了知识目录
+        if args.alphaedit_knowledge_dir:
+            # 从知识目录收集提示词
+            prompts = []
+            logger.info(f"Loading knowledge prompts from {args.alphaedit_knowledge_dir}...")
+            # 这里简单实现为读取文本文件，可以根据需求修改为从图像或其他资源生成提示词
+            knowledge_files = list(Path(args.alphaedit_knowledge_dir).glob("*.txt"))
+            for file in knowledge_files:
+                with open(file, "r", encoding="utf-8") as f:
+                    prompts.extend(f.read().splitlines())
+        else:
+            # 如果未提供知识目录，使用一组简单的通用提示词
+            logger.info("No knowledge directory specified. Using default prompts.")
+            prompts = [
+                "A photograph of a dog",
+                "A painting of a landscape",
+                "A portrait of a person",
+                "A sketch of a building",
+                "A digital art of a futuristic city",
+                # 可以根据需要添加更多提示词
+            ]
+        
+        # 限制样本数量
+        if len(prompts) > args.alphaedit_samples:
+            logger.info(f"Limiting prompts to {args.alphaedit_samples} samples...")
+            prompts = prompts[:args.alphaedit_samples]
+        else:
+            logger.info(f"Using {len(prompts)} prompts for AlphaEdit knowledge embedding...")
+        
+        # 确保阈值是浮点数
+        try:
+            threshold_value = float(args.alphaedit_threshold)
+            logger.info(f"Using threshold value: {threshold_value}")
+        except ValueError:
+            logger.warning(f"Invalid threshold value: {args.alphaedit_threshold}, using default 1e-5")
+            threshold_value = 1e-5
+            
+        # 收集知识嵌入
+        with torch.no_grad():
+            text_encoder.eval()
+            # 记录当前设备信息
+            if hasattr(text_encoder, 'parameters'):
+                text_encoder_device = next(text_encoder.parameters()).device
+                logger.info(f"Text encoder is on device: {text_encoder_device}, accelerator device: {accelerator.device}")
+                
+                # 确保text_encoder在正确的设备上
+                if text_encoder_device != accelerator.device:
+                    logger.info(f"Moving text_encoder to {accelerator.device}")
+                    text_encoder = text_encoder.to(accelerator.device)
+                
+            try:
+                # 使用改进的维度特定嵌入收集方法
+                dimension_embeddings, layer_dimensions = collect_layer_specific_embeddings(
+                    unet, 
+                    text_encoder, 
+                    tokenizer, 
+                    prompts, 
+                    accelerator.device,
+                    batch_size=16
+                )
+                
+                # 计算层特定的投影矩阵
+                logger.info("Computing layer-specific projection matrices...")
+                projection_matrices = compute_projection_matrices(
+                    dimension_embeddings, 
+                    layer_dimensions, 
+                    threshold_value
+                )
+                
+                # 验证得到了所有需要的投影矩阵
+                valid_matrices = [p is not None for p in projection_matrices]
+                if not all(valid_matrices):
+                    raise ValueError(f"Some projection matrices are None: {sum(valid_matrices)}/{len(projection_matrices)}")
+                
+                logger.info(f"Successfully created {len(projection_matrices)} projection matrices")
+                
+                # 确保所有投影矩阵在正确的设备上
+                projection_matrices = [matrix.to(accelerator.device) for matrix in projection_matrices]
+                
+                # 将投影矩阵保存到unet模型中
+                unet.projection_matrices = projection_matrices
+                
+                # 创建层到投影矩阵的映射，提高钩子函数效率
+                unet.layer_to_matrix_map = {}
+                
+                # 找到所有交叉注意力层
+                for idx, (name, module) in enumerate(find_cross_attention_layers(unet)):
+                    if idx < len(projection_matrices):
+                        # 将模块映射到其投影矩阵
+                        unet.layer_to_matrix_map[module] = projection_matrices[idx]
+                
+                logger.info(f"Created mapping for {len(unet.layer_to_matrix_map)} layers")
+                
+                logger.info("AlphaEdit initialization completed successfully!")
+                
+                print("[INFO ]All projection matrices initialized!")
+                
+            except Exception as e:
+                logger.error(f"Error during AlphaEdit initialization: {e}")
+                raise  # 重新抛出异常，中断训练过程
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():

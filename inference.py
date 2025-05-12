@@ -7,7 +7,7 @@ from peft import PeftModel, LoraConfig
 MODEL_NAME = "CompVis/stable-diffusion-v1-4"
 
 def get_lora_sd_pipeline(
-    ckpt_dir, base_model_name_or_path=None, dtype=torch.float16, device="cuda", adapter_name="default"
+    ckpt_dir, base_model_name_or_path=MODEL_NAME, dtype=torch.float16, device="cuda", adapter_name="default"
 ):
     unet_sub_dir = os.path.join(ckpt_dir, "unet")
     text_encoder_sub_dir = os.path.join(ckpt_dir, "text_encoder")
@@ -19,6 +19,11 @@ def get_lora_sd_pipeline(
         raise ValueError("Please specify the base model name or path")
 
     pipe = StableDiffusionPipeline.from_pretrained(base_model_name_or_path, torch_dtype=dtype).to(device)
+    
+    # 检查unet_sub_dir是否存在
+    if not os.path.exists(unet_sub_dir):
+        raise ValueError(f"unet子目录不存在: {unet_sub_dir}")
+
     pipe.unet = PeftModel.from_pretrained(pipe.unet, unet_sub_dir, adapter_name=adapter_name)
 
     if os.path.exists(text_encoder_sub_dir):
@@ -48,4 +53,5 @@ def main():
     image = pipe(prompt, num_inference_steps=50, guidance_scale=7, negative_prompt=negative_prompt).images[0]
     image.save("infer_img.jpg")
 
-main()
+if __name__ == "__main__":
+    main()

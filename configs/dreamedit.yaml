@@ -6,10 +6,10 @@ class_data_dir: "class_img/dog"
 instance_prompt: "a photo of sks dog"  
 class_prompt: "a photo of dog"  
 
-output_dir: "results/dreambooth"
+output_dir: "results/dreamedit"
 
 # AlphaEdit相关设置
-use_alphaedit: false
+use_alphaedit: true
 alphaedit_knowledge_dir: "knowledge_base"
 alphaedit_samples: 2000
 alphaedit_threshold: 1e-4
