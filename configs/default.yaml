@@ -1,6 +1,6 @@
 revision: null  
 tokenizer_name: null
-with_prior_preservation: true  
+with_prior_preservation: false  
 prior_loss_weight: 1.0  
 num_class_images: 200  
 validation_prompt: null  
@@ -16,8 +16,9 @@ use_alphaedit: false
 alphaedit_knowledge_dir: null
 alphaedit_samples: 1000
 alphaedit_threshold: 1e-5
+alphaedit_strict_protection: false
 
-use_lora: true  
+use_lora: false  
 lora_r: 16  
 lora_alpha: 27  
 lora_dropout: 0.0  
@@ -27,12 +28,12 @@ lora_text_encoder_alpha: 17
 lora_text_encoder_dropout: 0.0  
 lora_text_encoder_bias: "none"  
 
-num_dataloader_workers: 1  
+num_dataloader_workers: 16
 no_tracemalloc: false  
 train_batch_size: 1  
 sample_batch_size: 4  
 num_train_epochs: 1  
-max_train_steps: 800  
+max_train_steps: 400
 checkpointing_steps: 500  
 resume_from_checkpoint: null  
 gradient_accumulation_steps: 1  

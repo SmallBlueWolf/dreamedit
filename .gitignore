@@ -4,5 +4,7 @@
 /dataset
 /class_img
 /results
+/weight
 /eval_results
 /eval_weights
+/inference_results*

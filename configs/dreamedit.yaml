@@ -1,15 +1,65 @@
-pretrained_model_name_or_path: "CompVis/stable-diffusion-v1-4"   
+pretrained_model_name_or_path: "CompVis/stable-diffusion-v1-4"
 
 instance_data_dir: "dataset/dog"
-class_data_dir: "class_img/dog"
+class_data_dir: None
 
-instance_prompt: "a photo of sks dog"  
-class_prompt: "a photo of dog"  
+instance_prompt: "a photo of sks dog"
+class_prompt: None
 
-output_dir: "results/dreamedit"
+output_dir: "output_alphaedit_direct"
 
 # AlphaEdit相关设置
 use_alphaedit: true
-alphaedit_knowledge_dir: "knowledge_base"
+use_direct_edit: true
+
+# 投影矩阵参数
+w: 0.05  # 较低的强度可提高对文本条件的保留能力
+alphaedit_regularization: 20.0  # 较高的正则化可防止过拟合
+alphaedit_direct_every: 30  # 每30步应用一次直接修改
+alphaedit_strict_protection: true
+
+# 提供几个基础概念作为保留知识
+alphaedit_knowledge:
+  - "dog"
+  - "cat"
+  - "human"
+  - "house"
+  - "landscape"
+  - "city"
+  - "car"
+  - "animal"
+  - "bird"
+  - "flower"
+  - "tree"
+
+# 训练少量步数以防止过拟合  
+validation_prompt: "a photo of sks cat in a garden"
+validation_steps: 50
+num_validation_images: 4
+
+# 减少学习率以防止过拟合
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.01
+adam_epsilon: 1e-08
+max_grad_norm: 1.0
+
+enable_xformers_memory_efficient_attention: true
+gradient_checkpointing: false
+scale_lr: false
+
+# AlphaEdit相关设置
 alphaedit_samples: 2000
 alphaedit_threshold: 1e-4
+with_prior_preservation: false
+prompts: ["a photo of dog", "a photo of sks dog"]
+
+seed: 42
+resolution: 512
+mixed_precision: "fp16"
+train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 5e-6
+lr_scheduler: "constant"
+num_train_epochs: 1
+max_train_steps: 300
